@@ -13,7 +13,7 @@ make clean
 ```
 
 # Code and Experiment
-Reproducible Artifact is available [here](https://github.com/Generative-Program-Analysis/icse23-artifact-evaluation.git).
+Reproducible Artifact is available [here](https://github.com/rhyme-lang/rhyme).
 
 # Required LaTeX Packages
 ## Texlive
