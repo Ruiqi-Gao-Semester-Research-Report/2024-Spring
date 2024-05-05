@@ -129,6 +129,7 @@
 \definecolor{light-gray}{gray}{0.85}
 \usepackage{stackengine}
 \usepackage{mathpartir}
+\usepackage{float}
 \input{macros}
 
 %%
@@ -325,7 +326,107 @@ stmt2stmtloopAfterloop, on the other hand, is derived from stmt2stmtByLoop. And 
 \texttt{stmt2stmtloopAfterloop}, on the other hand, is derived from \texttt{stmt2stmtByLoop}, and it is constructed to hint an ordering of loops. If \inline{stmt2stmtByLoop[s1][s2][l2] = true}, we know that \texttt{s1} needs to wait for \texttt{s2}'s \texttt{l2} loop to close. This means \texttt{s1} needs to be emitted after \texttt{s2}'s \texttt{l2} loop closes. If \texttt{s1} depends on \texttt{l1} and \texttt{s2} does not depend on \texttt{l1}, \texttt{s1}'s \texttt{l1} loop needs to be scheduled after \texttt{s2}'s \texttt{l2} loop, and we set \inline{stmt2stmtloopAfterloop[s1][s2][l1][l2] = true}. We never emit a statement inside irrelevant loops according to the semantic constraints described in subsection \ref{semconst}. Since \texttt{s1} does not depend on \texttt{l2} and \texttt{s2} does not depend on \texttt{l1}, we will never emit \texttt{s1} inside \texttt{l2} and emit \texttt{s2} inside \texttt{l1}. \texttt{s1}'s \texttt{l1} and \texttt{s2}'s \texttt{l2} can not be nested within each other. Since we need to emit \texttt{s1} after \texttt{s2}'s \texttt{l2}, \texttt{s1}'s \texttt{l1} must also be scheduled after \texttt{s2}'s \texttt{l2}. This enforces an ordering between \texttt{l1} and \texttt{l2} per \texttt{s1} and \texttt{s2}. Whenever we have a list of statements that are ready to be issued, we can merge all the per statement-pair loop order among these statements into a local \texttt{loopAfterLoop} relation. This local \texttt{loopAfterLoop} relation tells us the order by which we should emit loops. This will be used as a hint for loop scheduling, which we will talk about in more detail in Section \ref{codeschedule}.\par
 In this section, we delve deep into the semantic constraints and dependency construction of our code generator. The constraints and dependencies form the basis of our code generation algorithm to ensure correctness. We will discuss the loop scheduling algorithm in more detail in the next section.
 \section{Code scheduling}\label{codeschedule}
+\iffalse
+Semantic constraints and pre-computed dependencies discipline code generation, enforcing restrictions on the code generator to guarantee correctness. They decide which statements should be scheduled before a statement. They restrict which loops a statement need to reside in. They also decide what loops need to be closed for a statement to be issuable.  However, they do not restrict a program structure. And they leave the code generator a lot of freedom to schedule statements and loops. \par
+As we mentioned in subsection \ref{semconst}, a loop can be emitted multiple times. Although we want to put all statements that depend on a generator in one loop body, sometimes it is infeasible due to the aforementioned \texttt{stmt2stmtByLoop} and \texttt{stmt2stmtloopAfterloop} dependencies. For example, consider the following IR snippet:
+\begin{lstlisting}[numbers=left]
+  tmp[1] += data1[*A]['val1']
+  tmp[2] += (data2[*B]['val2'] / tmp[1])
+  tmp[3][*A] = data1[*A]['val3'] / tmp[2]
+  \end{lstlisting}
+The semantic meaning of this snippet is not irrelevant here, we only care about the dependencies captured in the IR. Assignment 1 uses *A in the rhs, so it depends on *A, same thing for assignment 3, and assignment 2 depends on *B. Assignment 3 depends on assignment 2, and assignment 2 depends on assignment 1 due to the def-use chain. Since both assignment 1 and 2 compute an aggregation (sum), their loop (*A and *B) need to be closed for tmp[1] and tmp[2] to be fully materialized. Therefore assignment 2 need to wait for assignment 1's *A loop to close, assignment 3 need to wait for assignment 2's *B loop to close.\par
+Ideally, we want to put both assignment 1 and 3 in the same *A loop to reduce the loop control overhead, i.e., fuse assignment 1 and 3's *A loop. However, this is not possible due to the extra dependency of assignment 2. Assignment 2 needs to be emitted after assignment 1. So assignment 2's *B loop should be emitted after assignment 1's *A loop closes. Similarly, assignment 3's *A loop need to be after assignment 2's *B loop. So assignment 3's *A loop can only be scheduled after assignment1's *A loop closes. This prevents assignment 1 and 3 from being placed in the same *A loop.\par
+For large and complex applications, there are multiple fusion opportunities when scheduling code. And the compiler must carefully schedule loops to maximize fusion. For example, consider the following IR snippet:
+\begin{lstlisting}[numbers=left]
+  tmp[1][*A] += data1[*A][*B]['val1']
+  tmp[2][*A] = tmp[1][*A] + data2[*A]['val2']
+  tmp[3][*A] = tmp[1][*A] + data3[*A]['val3']
+  \end{lstlisting}
+Assignment 1 resides in both *A and *B loops, assignment 2 and 3 only resides in *A loop. Also, assignment 2 and 3 need to be scheduled after assignment 1 due to dependencies. We we emit assignment 1, if we choose to first emit *B loop and then emit *A loop inside *B loop. We can not put the succeeding assignments inside the nested *A loop as these assignments are only dependent on the *A loop, so they can not be nested within *B. Therefore, the compiler needs to close the *B and *A loop nest. Then reopen *A loop to emit assignment 2 and 3. If we choose to emit *A loop first when emitting assignment 1, this redundance will be eliminated and we can fuse assignment 1,2,3's *A loop.\par
+As we observed before, the code generator need to perform non-trivial reasoning to generate optimal loop structure for the IR while satisfy the dependencies. The goal is to maximize loop fusion to improve performance. We now present our heuristic-guided loop scheduling algorithm that can perform aggressive loop fusion efficiently.\par
+\fi
+Semantic constraints and pre-computed dependencies discipline code generation, enforcing restrictions on the code generator to guarantee correctness. They determine which statements should be scheduled before others, restrict the loops in which a statement can reside, and dictate which loops need to be closed for a statement to be issuable. However, they do not restrict the program structure, leaving the code generator with considerable freedom to schedule statements and loops.
+
+As mentioned in subsection \ref{semconst}, a loop can be emitted multiple times. Although we aim to place all statements that depend on a generator in one loop body, sometimes it is infeasible due to the aforementioned \texttt{stmt2stmtByLoop} and \texttt{stmt2stmtloopAfterloop} dependencies. For example, consider the following IR snippet:
+\begin{lstlisting}[numbers=left]
+tmp[1] += data1[*A]['val1']
+tmp[2] += (data2[*B]['val2'] / tmp[1])
+tmp[3][*A] = data1[*A]['val3'] / tmp[2]
+\end{lstlisting}
+The semantic meaning of this snippet is not relevant here; we only care about the dependencies captured in the IR. Assignment 1 uses \texttt{*A} in the right-hand side (RHS), so it depends on \texttt{*A}; the same goes for assignment 3, and assignment 2 depends on \texttt{*B}. Assignment 3 depends on assignment 2, and assignment 2 depends on assignment 1 due to the def-use chain. Since both assignment 1 and 2 compute an aggregation (sum), their loops (\texttt{*A} and \texttt{*B}) need to be closed for \texttt{tmp[1]} and \texttt{tmp[2]} to be fully materialized. Therefore, assignment 2 needs to wait for assignment 1's \texttt{*A} loop to close, and assignment 3 needs to wait for assignment 2's \texttt{*B} loop to close.
+
+Ideally, we want to put both assignment 1 and 3 in the same \texttt{*A} loop to reduce the loop control overhead, i.e., fuse assignment 1 and 3's \texttt{*A} loop. However, this is not possible due to the extra dependency of assignment 2. Assignment 2 needs to be emitted after assignment 1. So assignment 2's \texttt{*B} loop should be emitted after assignment 1's \texttt{*A} loop closes. Similarly, assignment 3's \texttt{*A} loop needs to be after assignment 2's \texttt{*B} loop. Thus, assignment 3's \texttt{*A} loop can only be scheduled after assignment 1's \texttt{*A} loop closes, preventing assignment 1 and 3 from being placed in the same \texttt{*A} loop.
+
+For large and complex applications, there are multiple fusion opportunities when scheduling code. The compiler must carefully schedule loops to maximize fusion. For example, consider the following IR snippet:\par
+\begin{figure}[H]
+\begin{lstlisting}[numbers=left]
+tmp[1][*A] += (data0[*A]['val0'] + data1[*B]['val1'])
+tmp[2][*A] = tmp[1][*A] + data2[*A]['val2']
+tmp[3][*A] = tmp[1][*A] + data3[*A]['val3']
+\end{lstlisting}
+\caption{}
+\label{loopheu}
+\end{figure}
+Assignment 1 resides in both \texttt{*A} and \texttt{*B} loops, while assignment 2 and 3 only reside in the \texttt{*A} loop. Also, assignment 2 and 3 need to be scheduled after assignment 1 due to dependencies. When we emit assignment 1, if we first emit the \texttt{*B} loop and then the \texttt{*A} loop inside the \texttt{*B} loop, we cannot put the succeeding assignments inside the nested \texttt{*A} loop as these assignments are only dependent on the \texttt{*A} loop, so they cannot be nested within \texttt{*B}. Therefore, the compiler needs to close the \texttt{*B} and \texttt{*A} loop nest and then reopen the \texttt{*A} loop to emit assignment 2 and 3. If we choose to emit the \texttt{*A} loop first when emitting assignment 1, this redundancy will be eliminated, and we can fuse assignment 1, 2, and 3's \texttt{*A} loop.
+
+As observed before, the code generator needs to perform non-trivial reasoning to generate an optimal loop structure for the IR while satisfying the dependencies. The goal is to maximize loop fusion to improve performance. We now present our heuristic-guided loop scheduling algorithm, which can perform aggressive loop fusion efficiently.
+\subsection*{Loop scheduling algorithm}
+\iffalse
+We use a heuristic guided approach to perform efficient loop scheduling. As we mentioned before, we use statement as the basic unit for code scheduling. \par
+\paragraph*{Iteratively emitting statements} If all prerequisite statements of a statement are emitted and have their loops (with respect to stmt2stmtByLoop) closed, we call this statement \textbf{ready}. If all dependent loops of a statement are opened, we call this statement \textbf{inloops}. If a statement is both ready and inloops, we call this statement \textbf{emittable}, and we can emit the statement. Since we have pre computed both stmtdeps, loopdeps and stmt2stmtByLoop, the first stage is trivial. We check for all remaining statements whether they are emittable, and emit them if so. We will iteratively emit statements until there are no emittable statements left.\par
+Although there are no emittable statements, some statements may still be ready, they just do not have all their dependent loops opened. If there are no ready statements, this means some statement are waiting for its prerequisites' loops to close. Then we close the current loop and return to the parent loop scope.\par
+ If there are several ready statements and they depend on multiple loops, we need to choose which loop to open next carefully. Careless choice of which loop to open next may eliminate future opportunities for loop fusion and generate suboptimal code. We also may take stmt2stmtloopAfterloop in to consideration, and avoid closing a loop halfway due to stmt2stmtByLoop, and reopen it later. To pick the optimal loop to open next, we use a greedy heuristic.\par
+\subsection*{Heuristic for opening new loop}
+We use a greedy heuristic to choose which loop to open next. When we have a set of ready statements, we first compute the set of loops that are currently unopened and are dependent by ready statements. Opening any of these loops will enable the opportunity for some ready statement to become emittable. Next, we compute a local loopAfterLoop relation by merging all the per-pair stmt2stmtloopAfterloop among un-emitted statements. This relation hints a loop order we need to follow when opening new loops. We do not want to open a loop and close it halfway due to the stmt2stmtByLoop dependencies. Then, we pick the loop that do not need to be scheduled after any other loops. If there is only one such loop, we just pick this loop and open it. \par
+If there are multiple such loops, we need to use a greedy heuristic to pick the best candidate. If there are multiple loops that can be opened, we want to open one that can host the most number of statements. If those loops are nested, we want to put the best candidate in the outer level, avoiding closing a loop halfway due to semantic constraints as discussed in Figure \ref{loopheu}.\par
+Our heuristic uses two statistics to pick the best candidate: \texttt{stmtCnt} and \texttt{readyStmtCnt}. For each loop candidate, stmtCnt computes the number of un-emitted statements that depend on it. readyStmtCnt computes the number of ready statements that depend on it. The heuristic first picks the loop candidate with a larger readyStmtCnt. In time of a tie, the heuristic picks the loop candidate with a larger stmtCnt.\par
+\paragraph*{Recurse into inner loop scope} After the heuristic pick the next loop to open, we open this new loop, and recurse inside the new loop scope. As the semantic constraints require all statements to be emitted only inside their dependent loops, we filter out the statements that do not depend on the new loop when we recurse. This can avoid place statement inside irrelevant loops.\par
+After we return from the recursion, we can repeat all stages again as some statements will become emittable after the recursion. We will again emit all emittable statements, then open a new loop to recurse. We will keep iterating until all statements are emitted.
+\fi
+We utilize a heuristic-guided approach to perform efficient loop scheduling. As mentioned earlier, we use statements as the basic unit for code scheduling.
+
+\paragraph*{Iteratively Emitting Statements} If all prerequisite statements of a statement are emitted and have their loops (with respect to \texttt{stmt2stmtByLoop}) closed, we call this statement \textbf{ready}. If all dependent loops of a statement are opened, we call this statement \textbf{inloops}. If a statement is both ready and inloops, we call this statement \textbf{emittable}, and we can emit the statement. Since we have pre-computed both \texttt{stmtdeps}, \texttt{loopdeps}, and \texttt{stmt2stmtByLoop}, the first stage is trivial. We check for all remaining statements whether they are emittable and emit them if so. We will iteratively emit statements until there are no emittable statements left.\par
+
+Although there are no emittable statements, some statements may still be ready; they just do not have all their dependent loops opened. If there are no ready statements, it means some statements are waiting for their prerequisites' loops to close. Then we close the current loop and return to the parent loop scope.\par
+
+If there are several ready statements and they depend on multiple loops, we need to carefully choose which loop to open next. Careless choice of which loop to open next may eliminate future opportunities for loop fusion and generate suboptimal code. We also take \texttt{stmt2stmtloopAfterloop} into consideration and avoid closing a loop halfway due to \texttt{stmt2stmtByLoop} and reopening it later. To pick the optimal loop to open next, we use a greedy heuristic.\par
+
+\subsection*{Heuristic for Opening New Loop}
+We employ a greedy heuristic to choose which loop to open next. When we have a set of ready statements, we first compute the set of loops that are currently unopened and are dependent on by ready statements. Opening any of these loops will enable the opportunity for some ready statement to become emittable. Next, we compute a local \texttt{loopAfterLoop} relation by merging all the per-pair \texttt{stmt2stmtloopAfterloop} among un-emitted statements. This relation indicates a loop order we need to follow when opening new loops. We do not want to open a loop and close it halfway due to the \texttt{stmt2stmtByLoop} dependencies. Then, we pick the loop that does not need to be scheduled after any other loops. If there is only one such loop, we pick this loop and open it.\par
+
+If there are multiple such loops, we need to use a greedy heuristic to pick the best candidate. If multiple loops can be opened, we want to open one that can host the most number of statements. If those loops are nested, we want to put the best candidate in the outer level, avoiding closing a loop halfway due to semantic constraints as discussed in Figure \ref{loopheu}.\par
+
+Our heuristic uses two statistics to pick the best candidate: \texttt{stmtCnt} and \texttt{readyStmtCnt}. For each loop candidate, \texttt{stmtCnt} computes the number of un-emitted statements that depend on it. \texttt{readyStmtCnt} computes the number of ready statements that depend on it. The heuristic first picks the loop candidate with a larger \texttt{readyStmtCnt}. In the case of a tie, the heuristic picks the loop candidate with a larger \texttt{stmtCnt}.\par
+
+\paragraph*{Recurse into Inner Loop Scope} After the heuristic picks the next loop to open, we open this new loop and recurse inside the new loop scope. As the semantic constraints require all statements to be emitted only inside their dependent loops, we filter out the statements that do not depend on the new loop when we recurse. This can avoid placing statements inside irrelevant loops.\par
+
+After we return from the recursion, we can repeat all stages again as some statements will become emittable after the recursion. We will again emit all emittable statements, then open a new loop to recurse. We will keep iterating until all statements are emitted.\par
+
+Our heuristic-guided loop scheduling algorithm greedily opens new loops to maximize loop fusion at code generation time. The code generator fuses the loops of different statements to improve performance. It generates efficient JavaScript code for loop-free, branch-free Rhyme IR, and then uses the backend compiler to compile the generated code into an executable format.
 \section{Evaluation}\label{evaluation}
+\iffalse
+In this section, we compare the old code generator and our new code generator. The old and new code generator differs in the following aspects:
+\begin{enumerate}
+  \item \textbf{Dependency granularity}: the old code generator only tracks dependencies at the temporary variable level while our new code generator track dependencies at the assignment level. This means our new code generator models the dependency more precisely and therefore have enabled more opportunities for code motion and scheduling. For example, in the old code generator, if both s1 and s2 writes to tmp1, and s1 needs to wait for s3's l loop to close to be emittable. s2 also needs wait for s3's l loop to close, regardless of the computation s2 represents (even if s2 is an unconditional initialization).\par
+  Also, the old code generator computes a global loopAfterLoop relation, while the new code generator computes a per statement-pair loopAfterLoop relation. The new loop scheduling algorithm computes a local loopAfterLoop relation based on the currently in-scope statements. Therefore, this loop ordering is more precise and up-to-date. This removes the outdated loop order restrictions in the old code generator and gives the compiler more flexibility to schedule loops.
+  \item \textbf{Semantic constraint}: the old code generator only allows the each generator to be emitted once. When the compiler could not make progress, It will emit the statements one by one without performing any loop fusion. In contrast, the new code generator by design allows a generator to be emitted multiple times as long as the semantic of the program is respected. The code generator will try to maximize fusing different statements' loops aggressively to improve performance.\par
+  The old generator also allow statements to be emitted inside irrelevant loops, which may sometimes gives incorrect results.
+\end{enumerate}
+\fi
+In this section, we compare the old code generator with our new code generator. The old and new code generators differ in the following aspects:
+
+\begin{enumerate}
+\item \textbf{Dependency granularity}: The old code generator only tracks dependencies at the temporary variable level, while our new code generator tracks dependencies at the assignment level. This means our new code generator models dependencies more precisely, enabling more opportunities for code motion and scheduling. For example, in the old code generator, if both $s1$ and $s2$ write to $tmp1$, and $s1$ needs to wait for $s3$'s loop to close to be emittable, $s2$ also needs to wait for $s3$'s loop to close, regardless of the computation $s2$ represents (even if $s2$ is an unconditional initialization of $tmp1$).
+
+Additionally, the old code generator computes a global \texttt{loopAfterLoop} relation, while the new code generator computes a per-statement-pair \texttt{loopAfterLoop} relation. The new loop scheduling algorithm computes a local \texttt{loopAfterLoop} relation based on the currently in-scope statements. Therefore, this loop ordering is more precise and up-to-date. This removes the outdated loop order restrictions in the old code generator and gives the compiler more flexibility to schedule loops.
+
+\item \textbf{Semantic constraint}: The old code generator only allows each generator to be emitted once. When the compiler could not make progress, it would emit the statements one by one without performing any loop fusion. In contrast, the new code generator, by design, allows a generator to be emitted multiple times as long as the semantics of the program are preserved. The code generator will try to maximize fusing different statements' loops aggressively to improve performance.
+
+The old generator also allows statements to be emitted inside irrelevant loops, which may sometimes yield incorrect results.
+\end{enumerate}
+
+
+
 \section{Conclusion}\label{conclusion}
 %\newpage
 \bibliographystyle{acm}
