@@ -200,6 +200,58 @@
            %{…}{{$\!...$}}1
 }
 
+\lstdefinestyle{JavaScriptTiny}{
+    style=JavaScript, % Inherit from the JavaScript style
+    basicstyle=\ttfamily\tiny,
+    numberstyle=\ttfamily\tiny, % Set the number style to \tiny
+}
+
+\lstdefinestyle{JavaScript}{
+    language=java,
+    basicstyle=\ttfamily\scriptsize,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!50!black},
+    stringstyle=\color{black},
+    showstringspaces=false,
+    breaklines=true,
+    breakatwhitespace=true,
+    tabsize=1,
+    numbersep=2pt,
+    numberstyle=\ttfamily\tiny,
+    % morekeywords={let, const, var, function, if, else, pipe, map, group, count, plus, minus,
+    % while, for, return, typeof, switch, case, merge, get, sum, min, max, div, keyval, apply, times},
+    morekeywords={let, const, var, function, if, else}
+    escapeinside={(*@}{@*)}
+}
+
+\lstdefinestyle{JavaScriptInline}{
+    language=java,
+    basicstyle=\ttfamily\scriptsize,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!50!black},
+    stringstyle=\color{black},
+    showstringspaces=true,
+    breaklines=true,
+    breakatwhitespace=true,
+    tabsize=1,
+    numbersep=2pt,
+    numberstyle=\ttfamily\tiny,
+    morekeywords={},
+    escapeinside={(*@}{@*)}
+}
+
+\lstset{style=JavaScript, upquote=true}
+
+\lstdefinestyle{JSComment}{
+    language=java,
+    basicstyle=\color{green!50!black}\ttfamily\scriptsize,
+    commentstyle=\color{green!50!black},
+    showstringspaces=true,
+    breaklines=true,
+    breakatwhitespace=true,
+    tabsize=1,
+}
+
 \definecolor{listingbg}{RGB}{240, 240, 240}
 
 \newcommand{\commentstyle}[1]{\color{ccomment}\itshape{#1}}
@@ -260,4 +312,6 @@
 \newcommand{\SECFork}{\textsc{sec}$_{{\mathrlap{<}-}}$}
 \newcommand{\SECConc}{\textsc{sec}$_v$}
 \newcommand{\SECBack}{\textsc{sec}$_{\hookleftarrow}$}
+\newcommand{\inline}[1]{\lstinline[style=JavaScriptInline,basicstyle=\ttfamily\small]{#1}}
+\newcommand{\highlight}[2][yellow]{\setlength{\fboxsep}{1pt}\colorbox{#1}{#2}}
 

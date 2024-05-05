@@ -133,8 +133,7 @@
 
 %%
 %% end of the preamble, start of the body of the document source.
-\newcommand{\tool}{\textsc{GenSym}\xspace}
-\newcommand{\klee}{\textsc{KLEE}\xspace}
+\newcommand{\rhyme}{\text{Rhyme}\xspace}
 \newcommand{\ul}[1]{\underline{#1}}
 \newcommand{\lb}{\{~}
 \newcommand{\rb}{~\}}
@@ -179,7 +178,9 @@
 }
 
 \begin{abstract}
-\cite{abeysinghe2024rhyme, abeysingherhyme}
+  \rhyme is a declarative multi-paradigm query language designed for querying nested data structures like JSON and performing tensor computation. \rhyme performs query optimization and code generation by generating a loop-free, branch-free intermediate representation. \rhyme IR does not explicitly capture program structures; instead, all program structures are implicitly captured by dependencies. This IR design allows for flexible code scheduling and optimization. However, it requires non-trivial reasoning and scheduling of the compiler to generate correct and performant code.\par
+
+  In this paper, we present an efficient code generation algorithm for \rhyme IR. Our algorithm performs aggressive loop scheduling and loop fusion to generate optimized code while ensuring program correctness. It conducts multiple dependency analyses to ensure correctness and uses a heuristic-guided greedy algorithm to perform aggressive loop fusion.
 \end{abstract}
 
 \keywords{Loop scheduling, Loop fusion, Code generation}
@@ -187,8 +188,145 @@
 \maketitle
 
 \section{Introduction}
+Rhyme\cite{abeysinghe2024rhyme, abeysingherhyme}, is a declarative language targeting the querying of nested data structures such as JSON and tensors. Rhyme draws inspiration from existing query languages like JQ \cite{jq}, GraphQL \cite{graphql}, and XQuery \cite{xquery} for querying nested data structures. Similar to Datalog \cite{datalog} and JSONPath \cite{jsonpath}, Rhyme employs logic variables * to explicitly represent iterators over data sources. Inspired by functional languages like Verse \cite{verse} and Curry \cite{curry}, Rhyme uses unification to represent aggregation. Additionally, Rhyme can express tensor computations mathematically, akin to Einstein notation \cite{einops, einsumblog, tensor_comprehensions}.
+
+Rhyme supports the expression of both traditional data processing operations such as aggregation, joins, and group-by, and mathematical computations like matrix multiplication and transpose in a unified language. Rhyme also includes internal support for data visualization, allowing users to perform various workloads in a single language without relying on multiple backends.
+
+To perform query optimization and code generation, Rhyme generates an intermediate representation (IR). Traditional IRs like LLVM \cite{lattner2004llvm} statically represent the program structure within the IR itself, with all statements scoped within blocks. Therefore, any code motion, such as hoisting, requires dependency analysis to ensure correctness. In contrast, the Sea of Nodes IR \cite{hotspot} does not explicitly impose program structure; instead, it captures all program structures implicitly through dependencies. This design allows for flexible code motion and local optimizations, with the program structure reconstructed during code generation. Inspired by \cite{rompf2010lightweight} and \cite{bravcevac2023graph}, Rhyme generates a loop-free, branch-free IR, capturing program structures via both data and control dependencies. While this design simplifies optimizations like loop hoisting and code scheduling, it complicates code generation, as the program structure must be reconstructed. The code generator needs to determine the order between loops, figure out how loops should be nested, and place instructions inside loops. Careless code placement, such as inserting an instruction inside a deeper loop nest, will cause redundant computations. This may also lead to incorrect results if the instruction corresponds to an aggregation in the source language. Therefore, the code generator must produce efficient code while respecting the semantics of the source language.\par
+
+In this paper, we introduce a novel code generation algorithm for Rhyme IR. It performs intelligent loop scheduling to derive an efficient loop structure for the program and utilizes a heuristic-guided algorithm to perform aggressive loop fusion. This optimization reduces extra loop control overhead, enables more optimization opportunities for the backend compiler, and reduces memory usage. The code generator guarantees program correctness by precomputing several program dependencies while respecting the semantic constraints of aggregations.
 \subsection{Paper Structure}
+\iffalse
 The paper is organized as follows: \par \par
+In section \ref{rhymeir}, we will look at the structure of Rhyme IR and its operators. This severs as a background for our code generation algorithm\par
+In section \ref{buildeps}, we will present several constraints that our code generator must follow to ensure program correctness. Then we will present the dependencies we need to pre-compute, these dependencies will be followed by the code generator during code scheduling to guarantee correctness.\par
+In section \ref{codeschedule}, we will dive deep into our code scheduling algorithm. We will investigate how the loop are scheduled and fused to improve performance. We will also look at the heuristic used to perform greedy scheduling.\par
+In section \ref{evaluation}, we compare the performance of old and new code generator of Rhyme, compare the generated code and explain the differences.\par
+In section \ref{conclusion}, we summarize the work and draw some conclusions.
+\fi
+The paper is organized as follows:\par \par
+In Section \ref{rhymeir}, we explore the structure of Rhyme IR and its operators, providing essential background for our code generation algorithm.\par
+In Section \ref{buildeps}, we present several constraints that our code generator must adhere to in order to ensure program correctness. We then detail the dependencies that need to be pre-computed, guiding the code generator during code scheduling to guarantee correctness.\par
+In Section \ref{codeschedule}, we delve into our code scheduling algorithm, examining how loops are scheduled and fused to improve performance. We also discuss the heuristic employed for greedy scheduling.\par
+In Section \ref{evaluation}, we compare the old and new code generators of Rhyme, compare the generated code and explain the differences.\par
+Finally, in Section \ref{conclusion}, we summarize our findings and draw conclusions.
+
+\section{Rhyme IR}\label{rhymeir}
+\iffalse
+Rhyme IR consists of two types of operators: \textit{generators} and \textit{assignments}:\begin{itemize}
+  \item Generators are operators responsible for iterating over data sources and intermediate results. Generator operations are transformed into loops in the generated code. User can use \inline{*} to represent a generator. For example, \inline{data.*} binds the generator \inline{*} to \inline{data}, it will iterate over \inline{data}, enumerating its values.
+  \item Assignments are operators that model all the computation for intermediate or final results. Rhyme generates temporaries in the IR to store intermediate results for sub-queries. For example, in query \inline{sum(data.*A.val) + sum(data.*B.val)}, \inline{sum(data.*A.val)} and \inline{sum(data.*B.val)} are stored in two temporaries - \inline{tmp[1]} and \inline{tmp[2]}. The final result is stored in \inline{tmp[0]}, and an assignment \inline{tmp[0] = tmp[1] + tmp[2]} is generated to compute the addition of the two sum.
+\end{itemize}
+As we mentioned above, intermediate results are stored in temporaries. Generators can iterate over temporaries, this will introduce a generator to temp dependencies. Also, since assignments can use temporaries as operand and write the result to temporaries, this create an assignment to temp dependencies. An assignment's right hand side (its operands) may also indexing into a data source/intermediate result by a generator. This gives us assignment to generator dependencies.\par
+Each assignment will write to a temporaries, i.e., its writeSym. There maybe multiple assignments write to a same temp. To ensure the correct ordering of those assignments and guarantee program correctness, Rhyme assigns write ranks to assignments that write to the same temp during IR generation. All assignments to the same temp must be ordered by their write rank. This gives us assignment to assignment dependencies. Since there maybe multiple assignments write to a temp, the temporary variable is not fully materialized until the last assignment that write to it. This introduces temp to assignment dependencies.\par
+Our brief discussions above already illustrate that the Rhyme IR models the complicated dependencies between generator, assignment and temp variables. When we generate code, we must faithful follow these dependencies in the IR to ensure program correctness.\par
+Besides the dependencies mentioned above, we also need to consider the semantic of aggregations in the IR. For temporaries that store aggregation results, we need to wait for it to be fully materialized in order to use it, otherwise we may use a partial aggregation and gives incorrect results. This will add extra dependencies in the IR level, we will talk more in detail about this in Section \ref{buildeps}.
+\fi
+Rhyme IR consists of two types of operators: \textit{generators} and \textit{assignments}:\begin{itemize}
+  \item Generators are operators responsible for iterating over data sources and intermediate results. Generator operations are transformed into loops in the generated code. Users can use \inline{*} to represent a generator. For example, \inline{data.*} binds the generator \inline{*} to \inline{data}, iterating over \inline{data} and enumerating its values.
+
+  \item Assignments are operators that model all computations for intermediate or final results. Rhyme generates temporaries in the IR to store intermediate results for sub-queries. For instance, in the query \inline{sum(data.*A.val) + sum(data.*B.val)}, \inline{sum(data.*A.val)} and \inline{sum(data.*B.val)} are stored in two temporaries - \inline{tmp[1]} and \inline{tmp[2]}. The final result is stored in \inline{tmp[0]}, and an assignment \inline{tmp[0] = tmp[1] + tmp[2]} is generated to compute the addition of the two sums.
+\end{itemize}
+As mentioned above, intermediate results are stored in temporaries. Generators can iterate over temporaries, introducing a generator-to-temp dependency. Additionally, since assignments can use temporaries as operands and write the result to temporaries, this creates an assignment-to-temp dependency. An assignment's right-hand side (its operands) may also index into a data source/intermediate result by a generator, resulting in assignment-to-generator dependencies.\par
+
+Each assignment will write to a temporary, i.e., its writeSym. There may be multiple assignments writing to the same temp. To ensure the correct ordering of those assignments and guarantee program correctness, Rhyme assigns write ranks to assignments that write to the same temp during IR generation. All assignments to the same temp must be ordered by their write rank. This results in assignment-to-assignment dependencies. Since there may be multiple assignments writing to a temp, the temporary variable is not fully materialized until the last assignment that writes to it. This introduces temp-to-assignment dependencies.\par
+
+Our brief discussions above illustrate that the Rhyme IR models the complex dependencies between generators, assignments, and temp variables. When generating code, we must faithfully follow these dependencies in the IR to ensure program correctness.\par
+
+In addition to the dependencies mentioned above, we also need to consider the semantics of aggregations in the IR. For temporaries that store aggregation results, we need to wait for them to be fully materialized before using them; otherwise, we may use a partial aggregation and obtain incorrect results. This introduces additional dependencies at the IR level, which we will discuss in more detail in Section \ref{buildeps}.
+\section{Semantic constraints and Dependency construction}\label{buildeps}
+\iffalse
+The code generator needs to follow several semantic constraints to ensure program correctness and generate efficient code. The code generator also needs to respect the dependencies between assignments and generators in th IR during code scheduling. In this section, we will delve into this two part. This will give us a deeper understanding of the intuition of our code scheduling algorithm. Since generators will be transformed into loops and assignments will be transformed into statements in the generated code. \par\textbf{Note: From now on, generator/loop and assignment/statement will be used interchangeably.}
+\subsection[]{Semantic constraints}
+We want to list several semantic constraints for the code generators here. These constraints will discipline the code generation for assignments and generators:
+\begin{enumerate}
+  \item \textbf{a statement will be only emitted once.} Since assignment model computations for intermediate and final results, they can be only emitted once.
+  \item \textbf{a loop maybe generated multiple times.} There could multiple assignments depend on one generator. The code generator can choose to either schedule them in one loop body or distribute them among multiple loops that correspond to the same generator. If a generator have n assignments depend on it. It can be generated at most n times.
+  \item \textbf{a statement will be emitted inside and only inside the loops it depends on.} This means we will never emit a statement inside irrelevant loops. Emitting an assignment inside irrelevant loops not only introduces extra overhead but may also gives incorrect results if the assignment computes an aggregation.
+  \item \textbf{statements and loops will be emitted while faithfully following the dependencies between them.} When emit statements and loops, the code generator must follow the dependencies between them to ensure program correctness. We will talk about this more in detail in subsection \ref{depsonstruct}.
+\end{enumerate}
+These four semantic constraints lay the foundation for our code generator. Any code generation algorithm following these constraints can guarantee the correctness of their generated program. A smart code generator, on the other hand, need to fuse different statements' loops together as much as possible to improve performance.
+\fi
+The code generator needs to follow several semantic constraints to ensure program correctness and generate efficient code. The code generator also needs to respect the dependencies between assignments and generators in the IR during code scheduling. In this section, we will delve into these two parts. This will give us a deeper understanding of the intuition behind our code scheduling algorithm. Since generators will be transformed into loops and assignments will be transformed into statements in the generated code.\par
+
+\textbf{Note: From now on, generator/loop and assignment/statement will be used interchangeably.}
+
+\subsection[]{Semantic constraints}\label{semconst}
+
+We want to list several semantic constraints for the code generator here. These constraints will discipline the code generation for assignments and generators:
+
+\begin{enumerate}
+\item \textbf{A statement will only be emitted once.} Since assignments model computations for intermediate and final results, they can only be emitted once.
+\item \textbf{A loop may be generated multiple times.} There could be multiple assignments depending on one generator. The code generator can choose to either schedule them in one loop body or distribute them among multiple loops that correspond to the same generator. If a generator has n assignments depending on it, it can be generated at most n times.
+\item \textbf{A statement will be emitted inside and only inside the loops it depends on.} This means we will never emit a statement inside irrelevant loops. Emitting an assignment inside irrelevant loops not only introduces extra overhead but may also give incorrect results if the assignment computes an aggregation.
+\item \textbf{Statements and loops will be emitted while faithfully following the dependencies between them.} When emitting statements and loops, the code generator must follow the dependencies between them to ensure program correctness. We will talk about this in more detail in subsection \ref{depsonstruct}.
+\end{enumerate}
+
+These four semantic constraints lay the foundation for our code generator. Any code generation algorithm following these constraints can guarantee the correctness of its generated program. However, these constraints do not enforce a strict program structure. Statements that are independent of each other can be scheduled in an arbitrary order. A generator can be emitted multiple times, so statements can be placed among them as long as the dependencies are followed. Therefore, a smart code generator needs to fuse different statements' loops together as much as possible to improve performance.
+\subsection[]{Dependency construction}\label{depsonstruct}
+\iffalse
+We briefly explored the dependencies of Rhyme IR in Section \ref{rhymeir}. We already observed a complicated dependency between assignments, generators and temporaries. Dependency to a temp can be inlined to the last assignment that update it. Therefore, we obtain four kinds of dependencies:
+\begin{enumerate}
+  \item \textbf{assignment-to-assignment} dependencies. These dependencies are introduced by the def-use effect of assignments. If assignment a uses temp1, and the last assignment that modifies temp1 is b, then a depends on b. Also, an assignment depends on the previous assignment that update the same temp (based on the write rank).
+  \item \textbf{assignment-to-generator} dependencies. If an assignment uses a generator (the rhs indexing into a temp by a generator or the lhs is grouped by the generator), the assignment depends on the generator.
+  \item \textbf{generator-to-assignment} dependencies. If a generator iterates over a temp, it depends on the last assignment that modifies this temp.
+  \item \textbf{generator-to-generator} dependencies. If the value that generator A iterates over is generated by another generator B, A depends on B. For example, in query \inline{data.*A.*B}, \inline{*A} depends on \inline{*B}.
+\end{enumerate}
+Dependencies are inherently transitive, if A depends on B and B depends on C, A also depends on C. According to our semantic constraints, assignment are only emitted once. Therefore, we use assignment/statement as the basic unit of dependencies. \par During dependencies construction phase, we first pre compute two types of dependencies:
+\begin{itemize}
+  \item \textbf{stmtdeps}: For each assignment/statement, this tracks all the assignments it transitively depends on, deriving from all four type of dependencies listed above.
+  \item \textbf{loopdeps}: For each assignment/statement, this tracks all the generators/loops it transitively depends on, i.e., the loop nests it resides in. When tracking loopdeps, we only follow assignment-to-generator and generator-to-generator dependencies. We never track loop dependencies beyond  assignments. The reason for it is simple: if assignment s1 depends on loop l1, and l1 depends on assignment s2. l1 only depends on the materialized result that s2 writes to. If s2 again depends on l2, the result is not fully materialized until l2 closes, therefore l1 does not need to be nested inside l2. As a result, s1 also does not depend on l2.
+\end{itemize}
+stmtdeps stores the dependencies between assignments, so we need to emit assignments following the topological order of this dependencies graph. For an assignment, when all prerequisites in stmtdeps are emitted, the assignment is ready to be emitted, although it may not have all loops opened at the moment. \par loopdeps then tells us the loops that an assignment need to be emitted in. An assignment can only be emitted when all loops it depends on are opened and all its prerequisites in stmtdeps are emitted.\par
+\fi
+We briefly explored the dependencies of Rhyme IR in Section \ref{rhymeir}. We already observed a complicated dependency between assignments, generators, and temporaries. Dependency to a temp can be inlined to the last assignment that updates it. Therefore, we obtain four kinds of dependencies:
+
+\begin{enumerate}
+\item \textbf{Assignment-to-assignment} dependencies: These dependencies are introduced by the def-use effect of assignments. If assignment $a$ uses $temp1$, and the last assignment that modifies $temp1$ is $b$, then $a$ depends on $b$. Also, an assignment depends on the previous assignment that updates the same temp (based on the write rank).
+\item \textbf{Assignment-to-generator} dependencies: If an assignment uses a generator (the rhs indexing into a temp by a generator or the lhs is grouped by the generator), the assignment depends on the generator.
+\item \textbf{Generator-to-assignment} dependencies: If a generator iterates over a temp, it depends on the last assignment that modifies this temp.
+\item \textbf{Generator-to-generator} dependencies: If the value that generator $A$ iterates over is generated by another generator $B$, $A$ depends on $B$. For example, in query \inline{data.*A.*B}, \inline{*B} depends on \inline{*A}.
+\end{enumerate}
+
+Dependencies are inherently transitive: if $A$ depends on $B$ and $B$ depends on $C$, $A$ also depends on $C$. According to our semantic constraints, assignments are only emitted once. Therefore, we use assignment/statement as the basic unit of dependencies.\par
+
+During the dependencies construction phase, we first pre-compute two types of dependencies:
+
+\begin{itemize}
+\item \textbf{Stmtdeps}: For each assignment/statement, this tracks all the assignments it transitively depends on, derived from all four types of dependencies listed above.
+\item \textbf{Loopdeps}: For each assignment/statement, this tracks all the generators/loops it transitively depends on, i.e., the loop nests it resides in. When tracking loopdeps, we only follow assignment-to-generator and generator-to-generator dependencies. We never track loop dependencies beyond assignments. The reason for this is simple: if assignment $s1$ depends on loop $l1$, and $l1$ depends on assignment $s2$, $l1$ only depends on the materialized result that $s2$ writes to. If $s2$ again depends on $l2$, the result is not fully materialized until $l2$ closes, therefore $l1$ does not need to be nested inside $l2$. As a result, $s1$ also does not depend on $l2$.
+\end{itemize}
+
+Stmtdeps stores the dependencies between assignments, so we need to emit assignments following the topological order of this dependency graph. For an assignment, when all prerequisites of it in stmtdeps are emitted, the assignment is ready to be emitted, although it may not have all loops opened at the moment.\par
+
+Loopdeps then tell us the loops that an assignment needs to be emitted in. An assignment can only be emitted when all loops it depends on are opened and all its prerequisites in stmtdeps are emitted.\par
+
+\iffalse
+Although stmtdeps and loopdeps already give us a lot of information about the program, it still does not fully model all the required dependencies. Rhyme is a query language by design, therefore it supports different types of aggregations - sum, count, min, max, etc. If an assignment computes the result of an aggregation and stores the result in a temp. The aggregation is only fully materialized until all the loops it depends on are all closed, i.e., the aggregation is fully computed. Any assignment that uses this temp will need to wait for the aggregation to be fully materialized, otherwise it may uses a partial aggregation and produce incorrect results.\par
+This observation inspires two extra dependencies we need to track to ensure program correctness:
+\begin{itemize}
+  \item \textbf{stmt2stmtByLoop}: if statement s1 depends on s2, this tracks the loops of s2 that need to be closed for s1 to be emittable. This is needed for aggregation statements. We need to wait for all dependent loops to close for the aggregation to be fully materialized.
+  \item \textbf{stmt2stmtloopAfterloop}: if assignment s1 depends on s2, this tracks the pair of loops (l1, l2) such that: s1 depends on l1, s2 depends on l2 and s1's l1 needed to be emitted after s2's l2. This gives an ordering of loops and will be used in the heuristic for loop scheduling.
+\end{itemize}
+We currently only track stmt2stmtByLoop and stmt2stmtloopAfterloop between statements that write to different temporary variables. If s1 depends on s2, we compute these two dependencies as follows:\par
+If s2 depends on loop l and s1 does not. Then s1 need to wait for s2's l loop to close so that the temp s2 writes to is fully materialized. So we need to set \inline{stmt2stmtByLoop[s1][s2][l] = true}. If s1 depends on l, s1 may or may not need to wait for s2's l to close, depending on the computation s2 models and how s1 uses s2's result. For example, if s2 writes to \inline{temp1[*l]} and s1 uses \inline{temp1[*l]}, s1 and s2 can be put in the same loop body for l. However, we can perform arithmetic operations on the generators in Rhyme. Since generator represents iterator, we can offset the generator for indexing. So, if s2 writes to \inline{temp1[*l]} and s1 uses \inline{temp1[func(*l)]}, s1 may need to wait for \inline{temp1} to be fully materialized to use it. Therefore, s1 and s2 may or may not be able to be put in the same l loop, depending on the semantic of \inline{func}. With more precise dependency analysis and reasoning, we can relax the requirements for stmt2stmtByLoop and explore more optimization opportunities. stmt2stmtByLoop offers a precise, fine-grained dependencies between statements with regard to loops. It gives the compiler more information about how loops should be scheduled. And the compiler construct stmt2stmtByLoop to reflect the semantic of different assignments and the dependencies between them.
+\fi
+Although \texttt{stmtdeps} and \texttt{loopdeps} already provide a lot of information about the program, they still do not fully model all the required dependencies. Rhyme is a query language by design; therefore, it supports different types of aggregations - sum, count, min, max, etc. If an assignment computes the result of an aggregation and stores the result in a temporary variable, the aggregation is only fully materialized when all the loops it depends on are closed, i.e., the aggregation is fully computed. Any assignment that uses this temporary variable will need to wait for the aggregation to be fully materialized; otherwise, it may use a partial aggregation and produce incorrect results.\par
+This observation inspires two extra dependencies we need to track to ensure program correctness:
+\begin{itemize}
+\item \textbf{stmt2stmtByLoop}: if statement \texttt{s1} depends on \texttt{s2}, this tracks the loops of \texttt{s2} that need to be closed for \texttt{s1} to be emittable. This is needed for aggregation statements. We need to wait for all dependent loops to close for the aggregation to be fully materialized.
+\item \textbf{stmt2stmtloopAfterloop}: if assignment \texttt{s1} depends on \texttt{s2}, this tracks the pair of loops (\texttt{l1}, \texttt{l2}) such that: \texttt{s1} depends on \texttt{l1}, \texttt{s2} depends on \texttt{l2} and \texttt{s1}'s \texttt{l1} needs to be emitted after \texttt{s2}'s \texttt{l2}. This gives an ordering of loops and will be used in the heuristic for loop scheduling.
+\end{itemize}
+We currently only track \texttt{stmt2stmtByLoop} and \texttt{stmt2stmtloopAfterloop} between statements that write to different temporary variables. If \texttt{s1} depends on \texttt{s2}, we compute these two dependencies as follows:\par
+If \texttt{s2} depends on loop \texttt{l} and \texttt{s1} does not, then \texttt{s1} needs to wait for \texttt{s2}'s \texttt{l} loop to close so that the temporary variable \texttt{s2} writes to is fully materialized. So we need to set \inline{stmt2stmtByLoop[s1][s2][l] = true}. If \texttt{s1} depends on \texttt{l}, \texttt{s1} may or may not need to wait for \texttt{s2}'s \texttt{l} to close, depending on the computation \texttt{s2} models and how \texttt{s1} uses \texttt{s2}'s result. For example, if \texttt{s2} writes to \texttt{temp1[*l]} and \texttt{s1} uses \texttt{temp1[*l]}, \texttt{s1} and \texttt{s2} can be put in the same loop body for \texttt{l}. However, we can perform arithmetic operations on the generators in Rhyme. Since a generator represents an iterator, we can offset the generator for indexing. So, if \texttt{s2} writes to \texttt{temp1[*l]} and \texttt{s1} uses \texttt{temp1[func(*l)]}, \texttt{s1} may need to wait for \texttt{temp1} to be fully materialized to use it. Therefore, \texttt{s1} and \texttt{s2} may or may not be able to be put in the same \texttt{l} loop, depending on the semantics of \texttt{func}. With more precise dependency analysis and reasoning, we can relax the requirements for \texttt{stmt2stmtByLoop} and explore more optimization opportunities. \texttt{stmt2stmtByLoop} offers precise, fine-grained dependencies between statements with regard to loops. It gives the compiler more information about how loops should be scheduled. And the compiler constructs \texttt{stmt2stmtByLoop} to reflect the semantics of different assignments and the dependencies between them.\par
+\iffalse
+stmt2stmtloopAfterloop, on the other hand, is derived from stmt2stmtByLoop. And it is constructed to hint an ordering of loops. If \inline{stmt2stmtByLoop[s1][s2][l2] = true}, we know that s1 need to wait for s2'l2 loop to close. This means s1 needs to be emitted after s2's l2 loop closes. If s1 depends on l1 and s2 does not depend on l1. s1's l1 loop needs to be scheduled after s2's l2 loop, and we set \inline{stmt2stmtloopAfterloop[s1][s2][l1][l2] = true}. We never emit a statement inside irrelevant loops according to the semantic constraints described in subsection \ref{semconst}.Since s1 does not depend on l2 and s2 does not depend on l1. We will never emit s1 inside l2 and emit s2 inside l1, s1's l1 and s2's l2 can not be nested within each other. Since we need to emit s1 after s2's l2, s1'l1 must also be scheduled after s2's l2. This enforecs an ordering between l1 and l2 per s1 and s2. Whenever we have a list of statements that are ready to be issued, we can merge all the per statement pair loop order among these statements into a local loopAfterLoop relation. This local loopAfterLoop relation tells us the order by which we should emit loops. This will be used as a hint for loop scheduling, which we will talk more in detail in Section \ref{codeschedule}.
+\fi
+\texttt{stmt2stmtloopAfterloop}, on the other hand, is derived from \texttt{stmt2stmtByLoop}, and it is constructed to hint an ordering of loops. If \inline{stmt2stmtByLoop[s1][s2][l2] = true}, we know that \texttt{s1} needs to wait for \texttt{s2}'s \texttt{l2} loop to close. This means \texttt{s1} needs to be emitted after \texttt{s2}'s \texttt{l2} loop closes. If \texttt{s1} depends on \texttt{l1} and \texttt{s2} does not depend on \texttt{l1}, \texttt{s1}'s \texttt{l1} loop needs to be scheduled after \texttt{s2}'s \texttt{l2} loop, and we set \inline{stmt2stmtloopAfterloop[s1][s2][l1][l2] = true}. We never emit a statement inside irrelevant loops according to the semantic constraints described in subsection \ref{semconst}. Since \texttt{s1} does not depend on \texttt{l2} and \texttt{s2} does not depend on \texttt{l1}, we will never emit \texttt{s1} inside \texttt{l2} and emit \texttt{s2} inside \texttt{l1}. \texttt{s1}'s \texttt{l1} and \texttt{s2}'s \texttt{l2} can not be nested within each other. Since we need to emit \texttt{s1} after \texttt{s2}'s \texttt{l2}, \texttt{s1}'s \texttt{l1} must also be scheduled after \texttt{s2}'s \texttt{l2}. This enforces an ordering between \texttt{l1} and \texttt{l2} per \texttt{s1} and \texttt{s2}. Whenever we have a list of statements that are ready to be issued, we can merge all the per statement-pair loop order among these statements into a local \texttt{loopAfterLoop} relation. This local \texttt{loopAfterLoop} relation tells us the order by which we should emit loops. This will be used as a hint for loop scheduling, which we will talk about in more detail in Section \ref{codeschedule}.\par
+In this section, we delve deep into the semantic constraints and dependency construction of our code generator. The constraints and dependencies form the basis of our code generation algorithm to ensure correctness. We will discuss the loop scheduling algorithm in more detail in the next section.
+\section{Code scheduling}\label{codeschedule}
+\section{Evaluation}\label{evaluation}
+\section{Conclusion}\label{conclusion}
 %\newpage
 \bibliographystyle{acm}
 \bibliography{paper}
