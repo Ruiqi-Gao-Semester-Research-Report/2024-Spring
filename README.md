@@ -13,7 +13,7 @@ make clean
 ```
 
 # Code and Experiment
-Reproducible Artifact is available [here](https://github.com/rhyme-lang/rhyme).
+Code and Reproducible Evaluation are available [here](https://github.com/rhyme-lang/rhyme) and [here](https://github.com/Kuigesi/2024-spring-report-reproducible).
 
 # Required LaTeX Packages
 ## Texlive
