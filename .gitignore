@@ -1,6 +1,6 @@
 acmart.cls
 acmart.pdf
-*.pdf
+paper.pdf
 build/*
 .vscode
 *.log
